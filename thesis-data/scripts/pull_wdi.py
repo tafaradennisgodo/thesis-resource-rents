@@ -54,16 +54,33 @@ README_SOURCE = "https://databank.worldbank.org/source/world-development-indicat
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+def _extract_id(field) -> str:
+    """Extract an ID from a WB metadata field that may be a dict, str, or None."""
+    if isinstance(field, dict):
+        return field.get("id", "") or ""
+    if isinstance(field, str):
+        return field
+    return ""
+
+
 def fetch_country_metadata(log) -> pd.DataFrame:
     """Return DataFrame of all WB countries with iso3, name, income group, region."""
     log.info("Fetching country metadata from WB API …")
     records = []
+    first = True
     for c in wb.economy.list():
+        if first:
+            il = c.get("incomeLevel")
+            rg = c.get("region")
+            log.info(f"  DEBUG first economy '{c['id']}': "
+                     f"incomeLevel type={type(il).__name__!r} value={il!r}  |  "
+                     f"region type={type(rg).__name__!r} value={rg!r}")
+            first = False
         records.append({
             "iso3":         c["id"],
             "country":      c["value"],
-            "income_group": c.get("incomeLevel", {}).get("id", ""),
-            "region":       c.get("region", {}).get("id", ""),
+            "income_group": _extract_id(c.get("incomeLevel")),
+            "region":       _extract_id(c.get("region")),
         })
     df = pd.DataFrame(records)
     log.info(f"  Total economies returned: {len(df)}")
