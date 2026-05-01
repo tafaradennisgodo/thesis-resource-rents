@@ -10,6 +10,9 @@ Outputs:
 import sys
 from pathlib import Path
 
+import time
+import concurrent.futures
+
 import pandas as pd
 import wbgapi as wb
 
@@ -109,39 +112,100 @@ def build_sample_frame(meta: pd.DataFrame, log) -> tuple[pd.DataFrame, list[str]
     return sample, iso3_list
 
 
-def pull_series(iso3_list: list[str], log) -> pd.DataFrame:
-    """Pull all SERIES for the sample frame and return a long-format DataFrame."""
-    series_codes = list(SERIES.keys())
-    log.info(f"Pulling {len(series_codes)} series for {len(iso3_list)} countries, "
-             f"years {min(YEARS)}–{max(YEARS)} …")
+FETCH_TIMEOUT   = 60   # seconds before falling back to chunked pull
+CHUNK_SIZE      = 5    # series per chunk in fallback mode
+RATE_LIMIT_WAIT = 10   # seconds to wait after a 429 before retry
 
-    raw = wb.data.DataFrame(
+
+def _wb_dataframe(series_codes: list[str], iso3_list: list[str]) -> pd.DataFrame:
+    """Single wbgapi call — runs in a thread so it can be interrupted."""
+    return wb.data.DataFrame(
         series_codes,
         economy=iso3_list,
         time=YEARS,
         skipBlanks=False,
-        skipAggs=True,      # exclude WB aggregate/regional rows
+        skipAggs=True,
         numericTimeKeys=True,
     )
-    # wbgapi returns wide format: index = (series, economy) or (economy, series),
-    # columns = years.  Normalise to long format.
-    raw = raw.reset_index()
 
-    # Column names differ slightly by wbgapi version — normalise
+
+def _raw_to_long(raw: pd.DataFrame) -> pd.DataFrame:
+    """Convert wbgapi wide output (MultiIndex × year columns) to long format."""
+    raw = raw.reset_index()
     raw.columns.name = None
     if "economy" not in raw.columns and "Country" in raw.columns:
         raw = raw.rename(columns={"Country": "economy"})
     if "series" not in raw.columns and "Series" in raw.columns:
         raw = raw.rename(columns={"Series": "series"})
 
-    id_vars = [c for c in raw.columns if c in {"economy", "series"}]
+    id_vars   = [c for c in raw.columns if c in {"economy", "series"}]
     year_cols = [c for c in raw.columns if str(c).isdigit()]
 
     long = raw.melt(id_vars=id_vars, value_vars=year_cols,
                     var_name="year", value_name="value")
-    long["year"] = long["year"].astype(int)
-    long = long.rename(columns={"economy": "iso3"})
+    long["year"]  = long["year"].astype(int)
     long["value"] = pd.to_numeric(long["value"], errors="coerce")
+    return long.rename(columns={"economy": "iso3"})
+
+
+def _fetch_with_retry(series_codes: list[str], iso3_list: list[str],
+                      log, label: str = "batch") -> pd.DataFrame:
+    """Call _wb_dataframe once; retry once on HTTP 429."""
+    for attempt in (1, 2):
+        try:
+            return _wb_dataframe(series_codes, iso3_list)
+        except wb.APIError as exc:
+            if attempt == 1 and "429" in str(exc):
+                log.warning(f"  [{label}] Rate-limited (429) — waiting {RATE_LIMIT_WAIT}s …")
+                time.sleep(RATE_LIMIT_WAIT)
+            else:
+                raise
+
+
+def _chunked_pull(series_codes: list[str], iso3_list: list[str], log) -> pd.DataFrame:
+    """Fallback: pull CHUNK_SIZE series at a time and concatenate."""
+    chunks   = [series_codes[i:i + CHUNK_SIZE]
+                for i in range(0, len(series_codes), CHUNK_SIZE)]
+    log.warning(f"  Falling back to chunked pull: {len(chunks)} chunks "
+                f"of ≤{CHUNK_SIZE} series each.")
+    longs = []
+    for idx, chunk in enumerate(chunks, 1):
+        label = f"chunk {idx}/{len(chunks)} {chunk}"
+        log.info(f"  Fetching {label} …")
+        t0  = time.time()
+        raw = _fetch_with_retry(chunk, iso3_list, log, label=label)
+        longs.append(_raw_to_long(raw))
+        log.info(f"  Done {label} — {len(longs[-1]):,} rows in {time.time()-t0:.1f}s")
+    return pd.concat(longs, ignore_index=True)
+
+
+def pull_series(iso3_list: list[str], log) -> pd.DataFrame:
+    """Pull all SERIES for the sample frame and return a long-format DataFrame."""
+    series_codes = list(SERIES.keys())
+    log.info(f"Pulling {len(series_codes)} series for {len(iso3_list)} countries, "
+             f"years {min(YEARS)}–{max(YEARS)} …")
+
+    # Attempt 1: single batched call with a hard timeout.
+    # wbgapi has no native timeout, so we run it in a thread and cancel if slow.
+    log.info(f"  Fetching all series in one batch (timeout={FETCH_TIMEOUT}s) …")
+    t0 = time.time()
+    long: pd.DataFrame | None = None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_fetch_with_retry, series_codes, iso3_list, log, "full batch")
+        try:
+            raw  = future.result(timeout=FETCH_TIMEOUT)
+            long = _raw_to_long(raw)
+            log.info(f"  Fetched {len(long):,} rows in {time.time()-t0:.1f}s")
+        except concurrent.futures.TimeoutError:
+            log.warning(f"  Single-batch call exceeded {FETCH_TIMEOUT}s — switching to chunked pull.")
+            future.cancel()
+
+    if long is None:
+        t0   = time.time()
+        long = _chunked_pull(series_codes, iso3_list, log)
+        log.info(f"  Chunked pull complete: {len(long):,} rows in {time.time()-t0:.1f}s")
+
     return long
 
 
